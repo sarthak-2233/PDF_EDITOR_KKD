@@ -1,7 +1,12 @@
 import sys
 import os
 import mimetypes
+import pyaudio
 import psd_tools
+import threading
+import time
+import numpy as np
+from datetime import datetime
 
 import fitz  # PyMuPDF
 from PyQt5.QtWidgets import (
@@ -13,9 +18,22 @@ from PyQt5.QtWidgets import (
 from PyQt5.QtGui import (
     QPixmap, QImage, QPainter, QPen, QPainterPath, QBrush, QColor, QIcon, QFont
 )
-from PyQt5.QtCore import Qt, QPointF, QRectF, QSize, QEvent, pyqtSignal
+from PyQt5.QtCore import Qt, QPointF, QRectF, QSize, QEvent, pyqtSignal, QTimer, QThread
 from PyQt5.QtWidgets import QGestureRecognizer
 from PyQt5.QtPrintSupport import QPrinter
+
+# Screen recording dependencies
+try:
+    import cv2
+    import pyaudio
+    import wave
+    import pyautogui
+    import subprocess
+    from PIL import Image, ImageGrab
+    RECORDING_AVAILABLE = True
+except ImportError as e:
+    print(f"Warning: Screen recording dependencies not available: {e}")
+    RECORDING_AVAILABLE = False
 
 # Optional: CSV & PSD
 try:
@@ -27,6 +45,180 @@ try:
     from psd_tools import PSDImage
 except ImportError:
     PSDImage = None
+
+class ScreenRecorder(QThread):
+    recording_finished = pyqtSignal(str)
+    recording_error = pyqtSignal(str)
+    
+    def __init__(self):
+        super().__init__()
+        self.recording = False
+        self.output_path = ""
+        self.fps = 30
+        self.audio_format = pyaudio.paInt16
+        self.channels = 2
+        self.rate = 44100
+        self.chunk = 1024
+        self.audio_frames = []
+        self.video_frames = []
+        
+    def start_recording(self, output_path):
+        self.output_path = output_path
+        self.recording = True
+        self.audio_frames = []
+        self.video_frames = []
+        self.start()
+        
+    def stop_recording(self):
+        self.recording = False
+        
+    def run(self):
+        try:
+            # Initialize audio recording
+            audio_thread = threading.Thread(target=self._record_audio)
+            audio_thread.daemon = True
+            audio_thread.start()
+            
+            # Record video
+            self._record_video()
+            
+            # Wait for audio thread to finish
+            audio_thread.join(timeout=2.0)
+            
+            # Combine audio and video
+            self._combine_audio_video()
+            
+        except Exception as e:
+            self.recording_error.emit(f"Recording error: {str(e)}")
+            
+    def _record_audio(self):
+        """Record system audio and microphone"""
+        try:
+            # Try to initialize audio recording
+            p = pyaudio.PyAudio()
+            
+            # Find default input device for microphone
+            default_input = p.get_default_input_device_info()
+            
+            stream = p.open(
+                format=self.audio_format,
+                channels=self.channels,
+                rate=self.rate,
+                input=True,
+                input_device_index=default_input['index'],
+                frames_per_buffer=self.chunk
+            )
+            
+            while self.recording:
+                try:
+                    data = stream.read(self.chunk, exception_on_overflow=False)
+                    self.audio_frames.append(data)
+                except Exception as e:
+                    print(f"Audio recording error: {e}")
+                    break
+                    
+            stream.stop_stream()
+            stream.close()
+            p.terminate()
+            
+        except Exception as e:
+            print(f"Audio initialization error: {e}")
+            # Continue without audio if there's an issue
+            
+    def _record_video(self):
+        """Record screen video"""
+        try:
+            # Get screen dimensions
+            screen = pyautogui.screenshot()
+            width, height = screen.size
+            
+            # Create temporary video file
+            temp_video_path = self.output_path.replace('.mp4', '_temp_video.avi')
+            
+            # Initialize video writer
+            fourcc = cv2.VideoWriter_fourcc(*'XVID')
+            out = cv2.VideoWriter(temp_video_path, fourcc, self.fps, (width, height))
+            
+            frame_duration = 1.0 / self.fps
+            last_time = time.time()
+            
+            while self.recording:
+                current_time = time.time()
+                
+                # Capture screenshot
+                screenshot = pyautogui.screenshot()
+                frame = np.array(screenshot)
+                frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+                
+                # Write frame
+                out.write(frame)
+                self.video_frames.append(frame)
+                
+                # Control frame rate
+                elapsed = time.time() - last_time
+                sleep_time = max(0, frame_duration - elapsed)
+                if sleep_time > 0:
+                    time.sleep(sleep_time)
+                last_time = time.time()
+                
+            out.release()
+            
+        except Exception as e:
+            print(f"Video recording error: {e}")
+            raise
+            
+    def _combine_audio_video(self):
+        """Combine audio and video using ffmpeg"""
+        try:
+            temp_video_path = self.output_path.replace('.mp4', '_temp_video.avi')
+            temp_audio_path = self.output_path.replace('.mp4', '_temp_audio.wav')
+            
+            # Save audio to temporary file
+            if self.audio_frames:
+                p = pyaudio.PyAudio()
+                wf = wave.open(temp_audio_path, 'wb')
+                wf.setnchannels(self.channels)
+                wf.setsampwidth(p.get_sample_size(self.audio_format))
+                wf.setframerate(self.rate)
+                wf.writeframes(b''.join(self.audio_frames))
+                wf.close()
+                p.terminate()
+                
+                # Combine using ffmpeg if available
+                try:
+                    cmd = [
+                        'ffmpeg', '-y',
+                        '-i', temp_video_path,
+                        '-i', temp_audio_path,
+                        '-c:v', 'libx264',
+                        '-c:a', 'aac',
+                        '-strict', 'experimental',
+                        self.output_path
+                    ]
+                    subprocess.run(cmd, check=True, capture_output=True)
+                    
+                    # Clean up temporary files
+                    if os.path.exists(temp_video_path):
+                        os.remove(temp_video_path)
+                    if os.path.exists(temp_audio_path):
+                        os.remove(temp_audio_path)
+                        
+                except (subprocess.CalledProcessError, FileNotFoundError):
+                    # Fallback: just save video without audio
+                    print("ffmpeg not available, saving video only")
+                    if os.path.exists(temp_video_path):
+                        os.rename(temp_video_path, self.output_path)
+                    if os.path.exists(temp_audio_path):
+                        os.remove(temp_audio_path)
+            else:
+                # No audio recorded, just rename video file
+                if os.path.exists(temp_video_path):
+                    os.rename(temp_video_path, self.output_path)
+                    
+            self.recording_finished.emit(self.output_path)
+            
+        except Exception as e:
+            self.recording_error.emit(f"Error combining audio/video: {str(e)}")
 
 class PDFDrawingView(QGraphicsView):
     def __init__(self, parent=None):
@@ -157,8 +349,6 @@ class PDFDrawingView(QGraphicsView):
                 self.current_path = None
                 self.current_item = None
         super().mouseReleaseEvent(event)
-
-    # ... (Tablet and touch support unchanged, omitted here for brevity)
 
     def undo(self):
         if self.undo_stack:
@@ -400,6 +590,14 @@ class PDFDrawingApp(QMainWindow):
         self.current_page = 0
         self.page_annotations = {}
         self.current_widget_type = 'graphics'
+        
+        # Screen recording setup
+        self.screen_recorder = None
+        self.is_recording = False
+        self.recording_start_time = None
+        self.recording_timer = QTimer()
+        self.recording_timer.timeout.connect(self.update_recording_status)
+        
         self.setup_ui()
         self.create_toolbar()
         self.create_statusbar()
@@ -448,6 +646,8 @@ class PDFDrawingApp(QMainWindow):
         self.status_bar = self.statusBar()
         self.zoom_label = QLabel("Zoom: 100%")
         self.page_label = QLabel("Page: -")
+        self.recording_label = QLabel("")
+        self.status_bar.addPermanentWidget(self.recording_label)
         self.status_bar.addPermanentWidget(self.zoom_label)
         self.status_bar.addPermanentWidget(self.page_label)
         self.status_bar.showMessage("Ready - Open a file to start drawing/annotating")
@@ -462,23 +662,39 @@ class PDFDrawingApp(QMainWindow):
         else:
             self.page_label.setText("Page: -")
 
+    def update_recording_status(self):
+        """Update recording timer display"""
+        if self.is_recording and self.recording_start_time:
+            elapsed = time.time() - self.recording_start_time
+            minutes = int(elapsed // 60)
+            seconds = int(elapsed % 60)
+            self.recording_label.setText(f"🔴 REC {minutes:02d}:{seconds:02d}")
+        else:
+            self.recording_label.setText("")
+
     def create_toolbar(self):
         self.toolbar = self.addToolBar("Main Toolbar")
         self.toolbar.setMovable(False)
         self.toolbar.setToolButtonStyle(Qt.ToolButtonTextUnderIcon)
         icon_size = int(32 * self.scale_factor)
         self.toolbar.setIconSize(QSize(icon_size, icon_size))
+        
+        # File operations
         self.open_action = QAction("📂 Open File", self)
         self.open_action.setShortcut("Ctrl+O")
         self.open_action.triggered.connect(self.open_file)
         self.toolbar.addAction(self.open_action)
         self.toolbar.addSeparator()
+        
+        # Drawing toggle
         self.draw_action = QAction("✏️ Draw", self)
         self.draw_action.setCheckable(True)
         self.draw_action.setChecked(False)
         self.draw_action.toggled.connect(self.toggle_drawing)
         self.toolbar.addAction(self.draw_action)
         self.toolbar.addSeparator()
+        
+        # Drawing tools
         tool_label = QLabel("Tool:")
         tool_label.setStyleSheet(f"font-size: {int(10 * self.scale_factor)}pt;")
         self.toolbar.addWidget(tool_label)
@@ -488,6 +704,7 @@ class PDFDrawingApp(QMainWindow):
         self.tool_combo.setStyleSheet(f"font-size: {int(10 * self.scale_factor)}pt;")
         self.tool_combo.currentTextChanged.connect(self.change_tool)
         self.toolbar.addWidget(self.tool_combo)
+        
         color_label = QLabel("Color:")
         color_label.setStyleSheet(f"font-size: {int(10 * self.scale_factor)}pt;")
         self.toolbar.addWidget(color_label)
@@ -497,6 +714,7 @@ class PDFDrawingApp(QMainWindow):
         self.color_combo.setStyleSheet(f"font-size: {int(10 * self.scale_factor)}pt;")
         self.color_combo.currentTextChanged.connect(self.change_color)
         self.toolbar.addWidget(self.color_combo)
+        
         size_label = QLabel("Size:")
         size_label.setStyleSheet(f"font-size: {int(10 * self.scale_factor)}pt;")
         self.toolbar.addWidget(size_label)
@@ -508,40 +726,182 @@ class PDFDrawingApp(QMainWindow):
         self.size_combo.currentTextChanged.connect(self.change_size)
         self.toolbar.addWidget(self.size_combo)
         self.toolbar.addSeparator()
+        
+        # Edit operations
         self.undo_action = QAction("↶ Undo", self)
         self.undo_action.setShortcut("Ctrl+Z")
         self.undo_action.triggered.connect(self.undo)
         self.toolbar.addAction(self.undo_action)
+        
         self.redo_action = QAction("↷ Redo", self)
         self.redo_action.setShortcut("Ctrl+Y")
         self.redo_action.triggered.connect(self.redo)
         self.toolbar.addAction(self.redo_action)
+        
         self.clear_action = QAction("🗑️ Clear", self)
         self.clear_action.triggered.connect(self.clear_annotations)
         self.toolbar.addAction(self.clear_action)
         self.toolbar.addSeparator()
+        
+        # Screen Recording
+        self.record_action = QAction("🎥 Start Recording", self)
+        self.record_action.setShortcut("Ctrl+R")
+        self.record_action.triggered.connect(self.toggle_screen_recording)
+        if not RECORDING_AVAILABLE:
+            self.record_action.setEnabled(False)
+            self.record_action.setToolTip("Screen recording not available - missing dependencies")
+        self.toolbar.addAction(self.record_action)
+        self.toolbar.addSeparator()
+        
+        # Save operations
         self.save_image_action = QAction("💾 Save Image", self)
         self.save_image_action.triggered.connect(self.view.save_as_image)
         self.toolbar.addAction(self.save_image_action)
+        
         self.save_pdf_action = QAction("📄 Save PDF", self)
         self.save_pdf_action.triggered.connect(self.view.save_as_pdf)
         self.toolbar.addAction(self.save_pdf_action)
         self.toolbar.addSeparator()
+        
+        # Zoom operations
         self.zoom_in_action = QAction("➕ Zoom In", self)
         self.zoom_in_action.setShortcut("Ctrl++")
         self.zoom_in_action.triggered.connect(self.view.zoom_in)
         self.toolbar.addAction(self.zoom_in_action)
+        
         self.zoom_out_action = QAction("➖ Zoom Out", self)
         self.zoom_out_action.setShortcut("Ctrl+-")
         self.zoom_out_action.triggered.connect(self.view.zoom_out)
         self.toolbar.addAction(self.zoom_out_action)
+        
         self.reset_zoom_action = QAction("↺ Reset Zoom", self)
         self.reset_zoom_action.setShortcut("Ctrl+0")
         self.reset_zoom_action.triggered.connect(self.view.reset_zoom)
         self.toolbar.addAction(self.reset_zoom_action)
+        
         spacer = QWidget()
         spacer.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         self.toolbar.addWidget(spacer)
+
+    def toggle_screen_recording(self):
+        """Start or stop screen recording"""
+        if not RECORDING_AVAILABLE:
+            QMessageBox.warning(self, "Recording Unavailable", 
+                              "Screen recording is not available. Please install required dependencies:\n"
+                              "pip install opencv-python pyaudio pyautogui pillow")
+            return
+            
+        if not self.is_recording:
+            self.start_screen_recording()
+        else:
+            self.stop_screen_recording()
+
+    def start_screen_recording(self):
+        """Start screen recording"""
+        try:
+            # Get save location
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            default_filename = f"screen_recording_{timestamp}.mp4"
+            
+            file_path, _ = QFileDialog.getSaveFileName(
+                self, "Save Screen Recording", default_filename, 
+                "MP4 Files (*.mp4);;All Files (*)"
+            )
+            
+            if not file_path:
+                return
+                
+            # Ensure .mp4 extension
+            if not file_path.lower().endswith('.mp4'):
+                file_path += '.mp4'
+            
+            # Initialize and start recorder
+            self.screen_recorder = ScreenRecorder()
+            self.screen_recorder.recording_finished.connect(self.on_recording_finished)
+            self.screen_recorder.recording_error.connect(self.on_recording_error)
+            
+            self.screen_recorder.start_recording(file_path)
+            
+            # Update UI
+            self.is_recording = True
+            self.recording_start_time = time.time()
+            self.record_action.setText("⏹️ Stop Recording")
+            self.record_action.setToolTip("Click to stop screen recording")
+            
+            # Start timer for status updates
+            self.recording_timer.start(1000)  # Update every second
+            
+            # Show notification
+            self.status_bar.showMessage(f"Screen recording started - Saving to: {os.path.basename(file_path)}")
+            
+            # Show recording indicator in a prominent way
+            QMessageBox.information(self, "Recording Started", 
+                                  f"Screen recording has started!\n"
+                                  f"Output: {os.path.basename(file_path)}\n\n"
+                                  f"Click 'Stop Recording' when done.\n"
+                                  f"You can continue working normally during recording.")
+            
+        except Exception as e:
+            QMessageBox.critical(self, "Recording Error", f"Failed to start recording:\n{str(e)}")
+            self.reset_recording_ui()
+
+    def stop_screen_recording(self):
+        """Stop screen recording"""
+        try:
+            if self.screen_recorder:
+                self.screen_recorder.stop_recording()
+                self.status_bar.showMessage("Stopping recording and processing video...")
+                
+                # Don't reset UI immediately - wait for recording to finish processing
+                self.record_action.setText("⏳ Processing...")
+                self.record_action.setEnabled(False)
+                
+        except Exception as e:
+            QMessageBox.critical(self, "Recording Error", f"Failed to stop recording:\n{str(e)}")
+            self.reset_recording_ui()
+
+    def on_recording_finished(self, file_path):
+        """Handle recording completion"""
+        self.reset_recording_ui()
+        
+        # Show completion message
+        reply = QMessageBox.information(
+            self, "Recording Complete", 
+            f"Screen recording saved successfully!\n\n"
+            f"File: {os.path.basename(file_path)}\n"
+            f"Location: {os.path.dirname(file_path)}\n\n"
+            f"Would you like to open the folder containing the recording?",
+            QMessageBox.Yes | QMessageBox.No
+        )
+        
+        if reply == QMessageBox.Yes:
+            try:
+                # Open folder containing the file
+                if sys.platform == "win32":
+                    os.startfile(os.path.dirname(file_path))
+                elif sys.platform == "darwin":
+                    subprocess.call(["open", os.path.dirname(file_path)])
+                else:
+                    subprocess.call(["xdg-open", os.path.dirname(file_path)])
+            except Exception as e:
+                print(f"Could not open folder: {e}")
+
+    def on_recording_error(self, error_message):
+        """Handle recording errors"""
+        self.reset_recording_ui()
+        QMessageBox.critical(self, "Recording Error", error_message)
+
+    def reset_recording_ui(self):
+        """Reset recording UI to initial state"""
+        self.is_recording = False
+        self.recording_start_time = None
+        self.recording_timer.stop()
+        self.record_action.setText("🎥 Start Recording")
+        self.record_action.setToolTip("Start screen recording")
+        self.record_action.setEnabled(True)
+        self.recording_label.setText("")
+        if self.screen_recorder:
+            self.screen_recorder = None
 
     def change_color(self, color_text):
         color_map = {
@@ -617,7 +977,6 @@ class PDFDrawingApp(QMainWindow):
             else:
                 QMessageBox.warning(self, "Unsupported Format", "That file type is not supported.")
 
-    # ---- PDF Handler and Logic remains unchanged, just refactored to accept file_path ---- #
     def open_pdf(self, file_path):
         try:
             if self.doc:
@@ -723,10 +1082,12 @@ class PDFDrawingApp(QMainWindow):
             scene = QGraphicsScene()
             self.view.setScene(scene)
             font_size = int(16 * self.scale_factor)
+            recording_status = "🎥 Screen Recording Available" if RECORDING_AVAILABLE else "🎥 Screen Recording Unavailable (missing deps)"
             text_item = scene.addText(
                 "Multi-Format Drawing Application\n\n"
                 "📂 Click 'Open File' to load a document or image\n"
                 "✏️ Use drawing tools to annotate\n"
+                f"{recording_status}\n"
                 "💾 Save your work as image or PDF\n\n"
                 f"Display Scale: {self.scale_factor:.1f}x",
                 QFont("Arial", font_size)
@@ -740,7 +1101,6 @@ class PDFDrawingApp(QMainWindow):
         except Exception as e:
             print(f"Error showing placeholder: {e}")
 
-    # ---- New Handlers for Images, CSV, PSD ---- #
     def switch_widget(self, widget_type):
         # Remove the right side widget and re-add the appropriate one
         if self.current_widget_type == widget_type:
@@ -832,6 +1192,22 @@ class PDFDrawingApp(QMainWindow):
         self.switch_widget('graphics')
 
     def closeEvent(self, event):
+        # Stop recording if active
+        if self.is_recording:
+            reply = QMessageBox.question(
+                self, "Recording Active",
+                "Screen recording is currently active. Do you want to stop recording and exit?",
+                QMessageBox.Yes | QMessageBox.No
+            )
+            if reply == QMessageBox.Yes:
+                self.stop_screen_recording()
+                # Give some time for recording to stop
+                QApplication.processEvents()
+                time.sleep(1)
+            else:
+                event.ignore()
+                return
+        
         if self.doc:
             reply = QMessageBox.question(
                 self, "Close Application",
@@ -853,6 +1229,12 @@ def main():
     app.setApplicationName("Multi-Format Drawing Application")
     app.setApplicationVersion("1.0")
     app.setStyle('Fusion')
+    
+    # Check for recording dependencies on startup
+    if not RECORDING_AVAILABLE:
+        print("Note: Screen recording is not available. Install dependencies with:")
+        print("pip install opencv-python pyaudio pyautogui pillow")
+    
     try:
         window = PDFDrawingApp()
         window.show()
