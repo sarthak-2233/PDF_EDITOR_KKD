@@ -206,12 +206,14 @@ class VideoProcessor(QThread):
                     h, w = diff.shape
                     roi = diff[int(h*0.1):int(h*0.9), int(w*0.2):int(w*0.8)]  # Central area
                     
+               
+               
                     # Detect significant changes that might indicate drawing
-                    threshold = cv2.threshold(roi, 30, 255, cv2.THRESH_BINARY)[1]
+                    threshold = cv2.threshold(roi, 10, 255, cv2.THRESH_BINARY)[1]
                     change_pixels = cv2.countNonZero(threshold)
                     
                     # If significant change detected (likely drawing/annotation)
-                    if change_pixels > (roi.shape[0] * roi.shape[1] * 0.001):  # 0.1% of ROI changed
+                    if change_pixels > 0:  # 0.1% of ROI changed
                         timestamp = frame_idx / fps
                         annotation_events.append({
                             'timestamp': timestamp,
@@ -1645,6 +1647,7 @@ def main():
     if RECORDING_AVAILABLE and AI_PROCESSING_AVAILABLE:
         print("🚀 All features available - enjoy the enhanced experience!")
     else:
+        
         print("ℹ️  Some features will be limited - install dependencies for full functionality")
     
     print("="*60 + "\n")
